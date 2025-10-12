@@ -495,7 +495,7 @@ exports.scrape = async (req, res) => {
 
     res.json({
       success: true,
-      data: merged,
+      products: merged,
       metadata: {
         total: merged.length,
         sources: {
