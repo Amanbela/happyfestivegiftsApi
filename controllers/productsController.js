@@ -347,10 +347,9 @@ const scrapeAmazon = async (search, category, highprice) => {
               .text()
               .trim();
             const offprice = $(element)
-              .find(".a-section.aok-inline-block > span, .a-text-price")
+              .find("div.a-section.aok-inline-block > span")
               .children(".a-offscreen")
-              .text()
-              .trim();
+              .text();
             const limit_time = $(element)
               .find(".a-badge-label, .s-deal-badge")
               .text()
@@ -372,7 +371,7 @@ const scrapeAmazon = async (search, category, highprice) => {
                   image: image || "",
                   title,
                   price: cleanPrice,
-                  offprice: offprice || "",
+                  offprice: offprice.replace(/[^0-9.]/g, "") || price,
                   limit_time: limit_time || "",
                   href: href || "",
                   source: "amazon",
@@ -450,12 +449,11 @@ exports.scrape = async (req, res) => {
 
     console.log(`Starting scrape for: "${search}"`);
 
-    const [amazonProducts, flipkartProducts, myntraProducts] =
-      await Promise.allSettled([
-        executeWithRateLimit(scrapeAmazon, search, category, highprice),
-        executeWithRateLimit(scrapeFlipkart, search, highprice),
-        executeWithRateLimit(scrapeMyntra, search, highprice),
-      ]);
+    const [amazonProducts, myntraProducts] = await Promise.allSettled([
+      executeWithRateLimit(scrapeAmazon, search, category, highprice),
+      // executeWithRateLimit(scrapeFlipkart, search, highprice),
+      executeWithRateLimit(scrapeMyntra, search, highprice),
+    ]);
 
     // Process results with error handling
     let merged = [];
@@ -468,13 +466,13 @@ exports.scrape = async (req, res) => {
       console.error("Amazon scraping failed:", amazonProducts.reason);
     }
 
-    // Process Flipkart results
-    if (flipkartProducts.status === "fulfilled" && flipkartProducts.value) {
-      merged = [...merged, ...flipkartProducts.value];
-      console.log(`Flipkart: Found ${flipkartProducts.value.length} products`);
-    } else {
-      console.error("Flipkart scraping failed:", flipkartProducts.reason);
-    }
+    // // Process Flipkart results
+    // if (flipkartProducts.status === "fulfilled" && flipkartProducts.value) {
+    //   merged = [...merged, ...flipkartProducts.value];
+    //   console.log(`Flipkart: Found ${flipkartProducts.value.length} products`);
+    // } else {
+    //   console.error("Flipkart scraping failed:", flipkartProducts.reason);
+    // }
 
     // Process Myntra results
     if (myntraProducts.status === "fulfilled" && myntraProducts.value) {
@@ -500,16 +498,11 @@ exports.scrape = async (req, res) => {
         total: merged.length,
         sources: {
           amazon: amazonProducts.status === "fulfilled",
-          flipkart: flipkartProducts.status === "fulfilled",
           myntra: myntraProducts.status === "fulfilled",
         },
         amazonCount:
           amazonProducts.status === "fulfilled"
             ? amazonProducts.value.length
-            : 0,
-        flipkartCount:
-          flipkartProducts.status === "fulfilled"
-            ? flipkartProducts.value.length
             : 0,
         myntraCount:
           myntraProducts.status === "fulfilled"
