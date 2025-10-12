@@ -45,14 +45,6 @@ const safeScrape = async (scrapeFunction, source, maxRetries = 2) => {
   }
 };
 
-// Browser launch helper
-const launchBrowser = () => {
-  return puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-};
-
 // Validate and sanitize inputs
 const validateScrapingParams = (search, highprice, category = "") => {
   if (!search || typeof search !== "string") {
@@ -168,121 +160,7 @@ const scrapeMyntra = async (search, highprice) => {
   return await safeScrape(scrapeFunction, "Myntra");
 };
 
-// Flipkart scrape with proper error handling
-const scrapeFlipkart = async (search, highprice) => {
-  const { sanitizedSearch, sanitizedHighPrice } = validateScrapingParams(
-    search,
-    highprice
-  );
-
-  const scrapeFunction = async (browser) => {
-    const searchQuery = sanitizedSearch.replace(/ /g, "%20");
-    const Flipkart_PAGE_URL = `https://www.flipkart.com/search?q=${searchQuery}&p%5B%5D=facets.price_range.from%3DMin&p%5B%5D=facets.price_range.to%3D${sanitizedHighPrice}`;
-
-    const page = await browser.newPage();
-
-    try {
-      // Set realistic browser headers and viewport
-      await page.setUserAgent(SCRAPING_CONFIG.userAgent);
-      await page.setViewport(SCRAPING_CONFIG.viewport);
-
-      // Set request timeout
-      await page.goto(Flipkart_PAGE_URL, {
-        waitUntil: "domcontentloaded",
-        timeout: SCRAPING_CONFIG.timeout,
-      });
-
-      // Wait for content to load
-      await page.waitForSelector("div.DOjaWF", { timeout: 10000 }).catch(() => {
-        console.log(
-          "Flipkart products container not found, continuing with available content"
-        );
-      });
-
-      const html = await page.content();
-      const $ = cheerio.load(html);
-      const results = [];
-
-      // Multiple selectors for better compatibility
-      $("div.DOjaWF, div._1AtVbE, div._2kHMtA").each((i, element) => {
-        try {
-          // Try multiple selectors for each field
-          const image = $(element)
-            .find("img[src*='flipkart'], .DByuf4, ._2r_T1I, ._396cs4")
-            .attr("src");
-          const title = $(element)
-            .find(".KzDlHZ, ._4rR01T, .s1Q9rs")
-            .text()
-            .trim();
-          const price = $(element)
-            .find(".Nx9bqj, ._30jeq3, ._1_WHN1")
-            .text()
-            .trim();
-          const offprice = $(element)
-            .find(".yRaY8j, ._3I9_wc, ._2p6lqe")
-            .text()
-            .trim();
-          const rating = $(element)
-            .find(".XQDdHH, ._3LWZlK, ._1lRcqv")
-            .text()
-            .trim();
-          const href = $(element)
-            .find("a[href*='flipkart'], .CGtC98, ._1fQZEK")
-            .attr("href");
-
-          if (title && price) {
-            const cleanPrice = price.replace(/[^0-9.]/g, "") || "0";
-
-            // Avoid duplicates
-            const exists = results.find(
-              (p) => p.title === title && p.price === cleanPrice
-            );
-
-            if (!exists && parseFloat(cleanPrice) > 0) {
-              results.push({
-                image: image || "",
-                title,
-                price: cleanPrice,
-                rating: rating || "No rating",
-                offprice: offprice || "",
-                href: href
-                  ? `https://www.flipkart.com${href.replace(
-                      /&affid=.*$/,
-                      ""
-                    )}&affid=kritesh`
-                  : "",
-                source: "flipkart",
-              });
-            }
-          }
-        } catch (elementError) {
-          console.error(
-            "Error processing Flipkart product element:",
-            elementError.message
-          );
-          // Continue with next element
-        }
-      });
-
-      if (results.length === 0) {
-        console.log(
-          "No products found on Flipkart for query:",
-          sanitizedSearch
-        );
-      }
-
-      return results;
-    } finally {
-      await page
-        .close()
-        .catch((error) => console.error("Error closing page:", error.message));
-    }
-  };
-
-  return await safeScrape(scrapeFunction, "Flipkart");
-};
-
-// Amazon scrape with proper error handling
+// ---------------- Amazon Scraper ----------------
 const scrapeAmazon = async (search, category, highprice) => {
   const { sanitizedSearch, sanitizedHighPrice, sanitizedCategory } =
     validateScrapingParams(search, highprice, category);
@@ -294,11 +172,10 @@ const scrapeAmazon = async (search, category, highprice) => {
     const page = await browser.newPage();
 
     try {
-      // Set realistic browser headers and viewport
       await page.setUserAgent(SCRAPING_CONFIG.userAgent);
       await page.setViewport(SCRAPING_CONFIG.viewport);
 
-      // Block images and unnecessary resources to speed up scraping
+      // Block images and unnecessary resources
       await page.setRequestInterception(true);
       page.on("request", (req) => {
         if (["image", "stylesheet", "font"].includes(req.resourceType())) {
@@ -313,17 +190,14 @@ const scrapeAmazon = async (search, category, highprice) => {
         timeout: SCRAPING_CONFIG.timeout,
       });
 
-      // Wait for content to load
       await page
         .waitForSelector(
           ".s-widget-container, [data-component-type='s-search-result']",
           { timeout: 10000 }
         )
-        .catch(() => {
-          console.log(
-            "Amazon products container not found, continuing with available content"
-          );
-        });
+        .catch(() =>
+          console.log("Amazon products container not found, continuing...")
+        );
 
       const html = await page.content();
       const $ = cheerio.load(html);
@@ -335,9 +209,10 @@ const scrapeAmazon = async (search, category, highprice) => {
             const image = $(element)
               .find(".s-image, .s-product-image-container img")
               .attr("src");
-            const titleElement = $(element).find(
-              ".s-title-instructions-style, .a-size-medium"
-            );
+            const title = $(element)
+              .find(".s-title-instructions-style, .a-size-medium")
+              .text()
+              .trim();
             const asin = $(element)
               .find("a.a-link-normal, .s-product-image-container a")
               .attr("href");
@@ -354,12 +229,10 @@ const scrapeAmazon = async (search, category, highprice) => {
               .find(".a-badge-label, .s-deal-badge")
               .text()
               .trim();
-            const title = titleElement.text().trim();
 
             let href = "";
             if (asin) {
-              // Clean the ASIN and build proper affiliate URL
-              const cleanAsin = asin.split("?")[0]; // Remove query parameters
+              const cleanAsin = asin.split("?")[0];
               href = `https://www.amazon.in${cleanAsin}&tag=happyfestiveg-21`;
             }
 
@@ -378,21 +251,19 @@ const scrapeAmazon = async (search, category, highprice) => {
                 });
               }
             }
-          } catch (elementError) {
-            console.error(
-              "Error processing Amazon product element:",
-              elementError.message
-            );
-            // Continue with next element
+          } catch (err) {
+            console.error("Error processing Amazon product:", err.message);
           }
         }
       );
 
-      if (results.length === 0) {
-        console.log("No products found on Amazon for query:", sanitizedSearch);
-      }
+      // ✅ Remove duplicates by title
+      const uniqueResults = Array.from(
+        new Map(results.map((item) => [item.title, item])).values()
+      );
 
-      return results;
+      console.log(`✅ Amazon found ${uniqueResults.length} unique products`);
+      return uniqueResults;
     } finally {
       await page
         .close()
@@ -403,37 +274,7 @@ const scrapeAmazon = async (search, category, highprice) => {
   return await safeScrape(scrapeFunction, "Amazon");
 };
 
-// Rate limiting and concurrency control
-const scrapingQueue = [];
-let activeScrapes = 0;
-const MAX_CONCURRENT_SCRAPES = 2;
-
-const executeWithRateLimit = async (scrapeFn, ...args) => {
-  return new Promise((resolve, reject) => {
-    const execute = async () => {
-      activeScrapes++;
-      try {
-        const result = await scrapeFn(...args);
-        resolve(result);
-      } catch (error) {
-        reject(error);
-      } finally {
-        activeScrapes--;
-        if (scrapingQueue.length > 0) {
-          scrapingQueue.shift()();
-        }
-      }
-    };
-
-    if (activeScrapes < MAX_CONCURRENT_SCRAPES) {
-      execute();
-    } else {
-      scrapingQueue.push(execute);
-    }
-  });
-};
-
-// Controller action to expose scraping via POST /products/scrape
+// ---------------- Controller ----------------
 exports.scrape = async (req, res) => {
   const {
     search = "",
@@ -442,7 +283,6 @@ exports.scrape = async (req, res) => {
   } = req.body || req.query || {};
 
   try {
-    // Validate request
     if (!search) {
       return res.status(400).json({ error: "Search query is required" });
     }
@@ -450,45 +290,29 @@ exports.scrape = async (req, res) => {
     console.log(`Starting scrape for: "${search}"`);
 
     const [amazonProducts, myntraProducts] = await Promise.allSettled([
-      executeWithRateLimit(scrapeAmazon, search, category, highprice),
-      // executeWithRateLimit(scrapeFlipkart, search, highprice),
-      executeWithRateLimit(scrapeMyntra, search, highprice),
+      scrapeAmazon(search, category, highprice),
+      scrapeMyntra(search, highprice),
     ]);
 
-    // Process results with error handling
     let merged = [];
 
-    // Process Amazon results
-    if (amazonProducts.status === "fulfilled" && amazonProducts.value) {
+    if (amazonProducts.status === "fulfilled") {
       merged = [...amazonProducts.value];
       console.log(`Amazon: Found ${amazonProducts.value.length} products`);
     } else {
       console.error("Amazon scraping failed:", amazonProducts.reason);
     }
 
-    // // Process Flipkart results
-    // if (flipkartProducts.status === "fulfilled" && flipkartProducts.value) {
-    //   merged = [...merged, ...flipkartProducts.value];
-    //   console.log(`Flipkart: Found ${flipkartProducts.value.length} products`);
-    // } else {
-    //   console.error("Flipkart scraping failed:", flipkartProducts.reason);
-    // }
-
-    // Process Myntra results
-    if (myntraProducts.status === "fulfilled" && myntraProducts.value) {
+    if (myntraProducts.status === "fulfilled") {
       merged = [...merged, ...myntraProducts.value];
       console.log(`Myntra: Found ${myntraProducts.value.length} products`);
     } else {
       console.error("Myntra scraping failed:", myntraProducts.reason);
     }
 
-    // Sort by price (low to high)
+    // Sort by price ascending
     merged = merged.sort(
-      (p1, p2) => parseFloat(p1.price || 0) - parseFloat(p2.price || 0)
-    );
-
-    console.log(
-      `Scraping completed. Found ${merged.length} products for: "${search}"`
+      (a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0)
     );
 
     res.json({
@@ -500,22 +324,11 @@ exports.scrape = async (req, res) => {
           amazon: amazonProducts.status === "fulfilled",
           myntra: myntraProducts.status === "fulfilled",
         },
-        amazonCount:
-          amazonProducts.status === "fulfilled"
-            ? amazonProducts.value.length
-            : 0,
-        myntraCount:
-          myntraProducts.status === "fulfilled"
-            ? myntraProducts.value.length
-            : 0,
       },
     });
   } catch (error) {
     console.error("Scrape controller error:", error);
-
-    const statusCode = error.message.includes("required") ? 400 : 500;
-
-    res.status(statusCode).json({
+    res.status(500).json({
       success: false,
       error: error.message || "Error scraping products",
       data: [],
