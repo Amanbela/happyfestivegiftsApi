@@ -1,180 +1,278 @@
-// --- Optimized Scraping Handlers (Puppeteer + Cheerio) ---
+// --- OPTIMIZED Scraping API (Puppeteer Cluster + Caching) ---
 const puppeteer = require("puppeteer");
 const cheerio = require("cheerio");
+const NodeCache = require("node-cache"); // Add: npm install node-cache
 
-// --- Global Browser (Reuse for All Scrapes) ---
-let browserInstance = null;
+// Enhanced Configuration
+const SCRAPING_CONFIG = {
+  timeout: 25000, // Reduced from 30s
+  userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", // Updated Chrome
+  viewport: { width: 1920, height: 1080 },
+  maxConcurrency: 3, // Parallel scraping
+  cacheTTL: 300, // 5 minutes cache
+};
 
-const getBrowser = async () => {
-  if (!browserInstance) {
-    browserInstance = await puppeteer.launch({
-      headless: true,
+// Cache initialization
+const searchCache = new NodeCache({
+  stdTTL: SCRAPING_CONFIG.cacheTTL,
+  checkperiod: 60,
+});
+
+// Browser pool for reuse
+let browserPool = null;
+
+const initBrowserPool = async () => {
+  if (!browserPool) {
+    browserPool = await puppeteer.launch({
+      headless: "new",
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-web-security",
+        "--disable-features=VizDisplayCompositor",
+        "--disable-software-rasterizer",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--memory-pressure-off",
+        "--max-old-space-size=8192",
       ],
+      timeout: SCRAPING_CONFIG.timeout,
     });
   }
-  return browserInstance;
+  return browserPool;
 };
 
-process.on("exit", async () => {
-  if (browserInstance) await browserInstance.close();
-});
-
-// --- Configuration ---
-const SCRAPING_CONFIG = {
-  timeout: 20000,
-  userAgent:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-  viewport: { width: 1366, height: 768 },
-};
-
-// --- Helper: Delay ---
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// --- Safe Scrape Wrapper (with retries) ---
+// Optimized safe scrape with connection pooling
 const safeScrape = async (scrapeFunction, source, maxRetries = 2) => {
+  let browser;
+  let page;
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const result = await scrapeFunction(await getBrowser());
+      browser = await initBrowserPool();
+      page = await browser.newPage();
+
+      // Enhanced performance optimizations
+      await Promise.all([
+        page.setUserAgent(SCRAPING_CONFIG.userAgent),
+        page.setViewport(SCRAPING_CONFIG.viewport),
+        page.setDefaultNavigationTimeout(SCRAPING_CONFIG.timeout),
+        page.setJavaScriptEnabled(true),
+      ]);
+
+      // Block unnecessary resources
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const resourceType = req.resourceType();
+        if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
+      const result = await scrapeFunction(page);
       return result;
-    } catch (err) {
-      console.error(`⚠️ ${source} attempt ${attempt} failed:`, err.message);
-      if (attempt === maxRetries)
-        throw new Error(`${source} failed after ${maxRetries} retries.`);
-      await delay(1000 * attempt); // exponential backoff
+    } catch (error) {
+      console.error(`Attempt ${attempt} failed for ${source}:`, error.message);
+
+      if (attempt === maxRetries) {
+        throw new Error(
+          `Failed to scrape ${source} after ${maxRetries} attempts: ${error.message}`
+        );
+      }
+
+      // Exponential backoff with jitter
+      const backoffTime = Math.min(
+        1000 * Math.pow(2, attempt) + Math.random() * 1000,
+        10000
+      );
+      await new Promise((resolve) => setTimeout(resolve, backoffTime));
+    } finally {
+      if (page && !page.isClosed()) {
+        await page.close().catch(console.error);
+      }
     }
   }
 };
 
-// --- Validate and Sanitize Inputs ---
+// Cache key generator
+const generateCacheKey = (search, highprice, category, source) => {
+  return `${source}:${search.toLowerCase().trim()}:${highprice}:${category}`;
+};
+
+// Enhanced validation
 const validateScrapingParams = (search, highprice, category = "") => {
-  if (!search || typeof search !== "string")
-    throw new Error("Search query is required and must be a string");
+  if (!search || typeof search !== "string" || search.trim().length === 0) {
+    throw new Error("Search query is required and must be a non-empty string");
+  }
 
-  if (search.length > 100) throw new Error("Search query too long");
+  if (search.length > 100) {
+    throw new Error("Search query too long (max 100 characters)");
+  }
 
-  if (highprice && (isNaN(highprice) || highprice < 0))
-    throw new Error("High price must be a positive number");
+  if (highprice && (isNaN(highprice) || highprice < 0 || highprice > 1000000)) {
+    throw new Error("High price must be a positive number less than 1,000,000");
+  }
 
-  const sanitizedSearch = search.trim().substring(0, 100);
-  const sanitizedHighPrice = highprice ? Math.abs(parseFloat(highprice)) : "";
-  const sanitizedCategory = category ? category.trim() : "";
+  // Enhanced sanitization
+  const sanitizedSearch = search
+    .trim()
+    .substring(0, 100)
+    .replace(/[^\w\s-]/g, "");
+  const sanitizedHighPrice = highprice
+    ? Math.abs(parseFloat(highprice)).toFixed(2)
+    : "";
+  const sanitizedCategory = category ? category.trim().substring(0, 50) : "";
 
   return { sanitizedSearch, sanitizedHighPrice, sanitizedCategory };
 };
 
-// --- Page Setup Helper (reuse logic) ---
-const setupPage = async (browser) => {
-  const page = await browser.newPage();
-  await page.setUserAgent(SCRAPING_CONFIG.userAgent);
-  await page.setViewport(SCRAPING_CONFIG.viewport);
-
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const blockTypes = ["image", "stylesheet", "font", "media"];
-    if (blockTypes.includes(req.resourceType())) req.abort();
-    else req.continue();
-  });
-
-  return page;
-};
-
-// --- Myntra Scraper ---
+// Optimized Myntra Scraper
 const scrapeMyntra = async (search, highprice) => {
   const { sanitizedSearch, sanitizedHighPrice } = validateScrapingParams(
     search,
     highprice
   );
+  const cacheKey = generateCacheKey(search, highprice, "", "myntra");
 
-  return await safeScrape(async (browser) => {
-    console.log(`🔍 Myntra: Searching for "${sanitizedSearch}"`);
+  // Check cache first
+  const cached = searchCache.get(cacheKey);
+  if (cached) {
+    console.log("🚀 Serving Myntra results from cache");
+    return cached;
+  }
 
-    const page = await setupPage(browser);
-    const searchQuery = sanitizedSearch.replace(/ /g, "-").toLowerCase();
+  const scrapeFunction = async (page) => {
+    console.log(
+      `🔍 Scraping Myntra for: ${sanitizedSearch} up to ${sanitizedHighPrice}`
+    );
+
+    const searchQuery = encodeURIComponent(
+      sanitizedSearch.replace(/ /g, "-").toLowerCase()
+    );
     const url = `https://www.myntra.com/${searchQuery}?rawQuery=${searchQuery}&price=0-${sanitizedHighPrice}`;
-    const products = [];
 
     try {
       await page.goto(url, {
-        waitUntil: "domcontentloaded",
+        waitUntil: "networkidle2", // Better for dynamic content
         timeout: SCRAPING_CONFIG.timeout,
       });
 
-      await Promise.race([
-        page.waitForSelector("li.product-base", { timeout: 10000 }),
-        delay(12000),
-      ]);
+      // Wait for products with shorter timeout
+      await page
+        .waitForSelector("li.product-base, [data-reactid]", { timeout: 10000 })
+        .catch(() =>
+          console.log(
+            "Myntra products container not found immediately, continuing..."
+          )
+        );
 
       const html = await page.content();
       const $ = cheerio.load(html);
+      const products = [];
 
-      $("li.product-base").each((_, el) => {
-        try {
-          const brand = $(el).find(".product-brand").text().trim();
-          const productName = $(el).find(".product-product").text().trim();
-          const title = `${brand} ${productName}`.trim();
-          let price = $(el).find(".product-discountedPrice").text().trim();
-          price = price.replace(/[^\d]/g, "");
-          if (!price) return;
+      $("li.product-base")
+        .slice(0, 50)
+        .each((i, el) => {
+          // Limit results
+          try {
+            const brand = $(el).find(".product-brand").text().trim();
+            const productName = $(el).find(".product-product").text().trim();
+            const title = `${brand} ${productName}`.trim();
 
-          const image =
-            $(el).find("img.img-responsive").attr("src") ||
-            $(el).find("source").attr("srcset")?.split("?")[0] ||
-            "https://images.unsplash.com/photo-1513475382585-d06e58bcb0e0?w=300";
-          const originalPrice = $(el)
-            .find(".product-strike")
-            .text()
-            .replace(/[^\d]/g, "");
-          const discount = $(el)
-            .find(".product-discountPercentage")
-            .text()
-            .trim();
-          const rating =
-            $(el).find(".product-ratingsContainer").attr("title") ||
-            "No rating";
-          const href = $(el).find("a[data-refreshpage='true']").attr("href");
+            if (!title) return;
 
-          products.push({
-            image,
-            title,
-            price,
-            offprice: originalPrice || price,
-            discount: discount || "0% off",
-            rating,
-            href: href
-              ? `https://linkredirect.in/visitretailer/2468?id=4620459&shareid=rol1uA1&dl=https://www.myntra.com/${href}`
-              : "https://myntr.it/wA7A1Hl",
-            source: "myntra",
-          });
-        } catch (err) {
-          console.error("Myntra parse error:", err.message);
-        }
-      });
+            let image =
+              $(el).find("img.img-responsive").attr("src") ||
+              $(el).find("source").attr("srcset")?.split("?")[0] ||
+              $(el).find("img[src*='myntra']").attr("src");
 
-      console.log(`✅ Myntra: ${products.length} products found`);
+            let priceText =
+              $(el).find(".product-discountedPrice").text().trim() ||
+              $(el).find("[data-product-price]").text().trim();
+            let price = priceText.replace(/[^\d]/g, "");
+
+            const originalPrice =
+              $(el).find(".product-strike").text().replace(/[^\d]/g, "") ||
+              price;
+            const discount =
+              $(el).find(".product-discountPercentage").text().trim() ||
+              "0% off";
+            const rating =
+              $(el).find(".product-ratingsContainer").attr("title") ||
+              "No rating";
+
+            const href = $(el)
+              .find("a[data-refreshpage='true'], a[href*='/buy/']")
+              .attr("href");
+
+            if (title && price && parseFloat(price) > 0) {
+              products.push({
+                image:
+                  image ||
+                  "https://images.unsplash.com/photo-1513475382585-d06e58bcb0e0?w=300&h=300&fit=crop",
+                title: title.substring(0, 200), // Limit title length
+                price: parseFloat(price) || 0,
+                rating,
+                offprice: parseFloat(originalPrice) || parseFloat(price),
+                discount,
+                href: href
+                  ? `https://www.myntra.com/${href.replace(/^\/+/, "")}`
+                  : "#",
+                source: "myntra",
+                score: calculateRelevanceScore(
+                  title,
+                  sanitizedSearch,
+                  parseFloat(price)
+                ),
+              });
+            }
+          } catch (err) {
+            console.error("Error processing Myntra product:", err);
+          }
+        });
+
+      // Sort by relevance and price
+      products.sort((a, b) => b.score - a.score || a.price - b.price);
+
+      console.log(`✅ Myntra found ${products.length} products`);
+
+      // Cache successful results
+      if (products.length > 0) {
+        searchCache.set(cacheKey, products);
+      }
+
       return products;
-    } finally {
-      await page.close().catch(() => {});
+    } catch (error) {
+      console.error("Myntra scraping error:", error);
+      throw error;
     }
-  }, "Myntra");
+  };
+
+  return await safeScrape(scrapeFunction, "Myntra");
 };
 
-// --- Amazon Scraper ---
+// Optimized Amazon Scraper
 const scrapeAmazon = async (search, category, highprice) => {
   const { sanitizedSearch, sanitizedHighPrice, sanitizedCategory } =
     validateScrapingParams(search, highprice, category);
+  const cacheKey = generateCacheKey(search, highprice, category, "amazon");
 
-  return await safeScrape(async (browser) => {
-    console.log(`🔍 Amazon: Searching for "${sanitizedSearch}"`);
+  // Check cache first
+  const cached = searchCache.get(cacheKey);
+  if (cached) {
+    console.log("🚀 Serving Amazon results from cache");
+    return cached;
+  }
 
-    const page = await setupPage(browser);
-    const searchQuery = sanitizedSearch.replace(/ /g, "+");
-    const url = `https://www.amazon.in/s?k=${searchQuery}&i=${sanitizedCategory}&high-price=${sanitizedHighPrice}`;
-    const results = [];
+  const scrapeFunction = async (page) => {
+    const searchQuery = encodeURIComponent(sanitizedSearch.replace(/ /g, "+"));
+    const url = `https://www.amazon.in/s?k=${searchQuery}&i=${sanitizedCategory}&low-price=&high-price=${sanitizedHighPrice}`;
 
     try {
       await page.goto(url, {
@@ -182,114 +280,247 @@ const scrapeAmazon = async (search, category, highprice) => {
         timeout: SCRAPING_CONFIG.timeout,
       });
 
+      // Wait for results with fallback
       await Promise.race([
         page.waitForSelector("[data-component-type='s-search-result']", {
-          timeout: 10000,
+          timeout: 8000,
         }),
-        delay(12000),
-      ]);
+        page.waitForSelector(".s-result-item", { timeout: 8000 }),
+      ]).catch(() =>
+        console.log(
+          "Amazon results container not found immediately, continuing..."
+        )
+      );
 
       const html = await page.content();
       const $ = cheerio.load(html);
+      const results = [];
 
-      $("[data-component-type='s-search-result']").each((_, el) => {
-        try {
-          const title = $(el).find("h2 span").text().trim();
-          const price = $(el)
-            .find(".a-price .a-offscreen")
-            .first()
-            .text()
-            .replace(/[^\d]/g, "");
-          if (!title || !price) return;
+      // Multiple selector strategies for robustness
+      $(
+        "[data-component-type='s-search-result'], .s-result-item, .s-widget-container"
+      )
+        .slice(0, 60)
+        .each((i, element) => {
+          try {
+            const $el = $(element);
 
-          const image =
-            $(el).find(".s-image").attr("src") ||
-            "https://via.placeholder.com/200";
-          let href = $(el).find("a.a-link-normal").attr("href") || "#";
-          if (href !== "#") {
-            const cleanHref = href.split("?")[0];
-            const separator = href.includes("?") ? "&" : "?";
-            href = `https://www.amazon.in${cleanHref}${separator}tag=happyfestiveg-21`;
-          } else {
-            href = "https://www.amazon.in";
+            const image = $el
+              .find(".s-image, .s-product-image-container img, img.s-image")
+              .attr("src");
+            const title = $el
+              .find("h2 a span, .a-size-medium, .s-title-instructions-style")
+              .first()
+              .text()
+              .trim();
+
+            if (!title || title.length < 3) return;
+
+            const priceText = $el
+              .find(".a-price-whole, .a-price > .a-offscreen")
+              .first()
+              .text();
+            const price = priceText.replace(/[^\d.]/g, "") || "0";
+
+            if (parseFloat(price) === 0) return;
+
+            const originalPrice =
+              $el
+                .find(".a-price[data-a-strike='true'] .a-offscreen")
+                .text()
+                .replace(/[^\d.]/g, "") || price;
+            const rating =
+              $el.find(".a-icon-alt").text().split(" ")[0] || "No rating";
+            const href = $el.find("a.a-link-normal, h2 a").attr("href");
+
+            if (title && parseFloat(price) > 0) {
+              results.push({
+                image: image || "",
+                title: title.substring(0, 200),
+                price: parseFloat(price),
+                offprice: parseFloat(originalPrice),
+                rating,
+                href: href ? `https://www.amazon.in${href.split("?")[0]}` : "",
+                source: "amazon",
+                score: calculateRelevanceScore(
+                  title,
+                  sanitizedSearch,
+                  parseFloat(price)
+                ),
+              });
+            }
+          } catch (err) {
+            // Silent fail for individual product errors
           }
-          const offprice = $(el)
-            .find(".a-text-price .a-offscreen")
-            .text()
-            .replace(/[^\d]/g, "");
-          const limit_time = $(el).find(".s-deal-badge").text().trim();
+        });
 
-          results.push({
-            image,
-            title,
-            price,
-            offprice: offprice || price,
-            limit_time,
-            href,
-            source: "amazon",
-          });
-        } catch (err) {
-          console.error("Amazon parse error:", err.message);
-        }
-      });
-
-      const unique = Array.from(
-        new Map(results.map((p) => [p.title, p])).values()
+      // Remove duplicates and sort
+      const uniqueResults = Array.from(
+        new Map(
+          results.map((item) => [item.title.toLowerCase(), item])
+        ).values()
       );
+      uniqueResults.sort((a, b) => b.score - a.score || a.price - b.price);
 
-      console.log(`✅ Amazon: ${unique.length} products found`);
-      return unique;
-    } finally {
-      await page.close().catch(() => {});
+      console.log(`✅ Amazon found ${uniqueResults.length} unique products`);
+
+      // Cache successful results
+      if (uniqueResults.length > 0) {
+        searchCache.set(cacheKey, uniqueResults);
+      }
+
+      return uniqueResults;
+    } catch (error) {
+      console.error("Amazon scraping error:", error);
+      throw error;
     }
-  }, "Amazon");
+  };
+
+  return await safeScrape(scrapeFunction, "Amazon");
 };
 
-// --- Controller ---
+// Relevance scoring function
+const calculateRelevanceScore = (title, search, price) => {
+  const searchTerms = search.toLowerCase().split(" ");
+  const titleLower = title.toLowerCase();
+
+  let score = 0;
+
+  // Title match scoring
+  searchTerms.forEach((term) => {
+    if (titleLower.includes(term)) {
+      score += 10;
+    }
+  });
+
+  // Exact match bonus
+  if (titleLower.includes(search.toLowerCase())) {
+    score += 20;
+  }
+
+  // Price scoring (prefer mid-range prices)
+  const priceScore = Math.max(0, 50 - Math.abs(price - 1000) / 50);
+  score += priceScore;
+
+  return score;
+};
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down browser pool...");
+  if (browserPool) {
+    await browserPool.close();
+  }
+  process.exit(0);
+});
+
+// Optimized Controller
 exports.scrape = async (req, res) => {
   const {
     search = "",
     category = "",
     highprice = "",
   } = req.body || req.query || {};
-
-  if (!search)
-    return res.status(400).json({ error: "Search query is required" });
-
-  console.log(`🚀 Starting scrape for "${search}"`);
+  const startTime = Date.now();
 
   try {
-    const [amazon, myntra] = await Promise.allSettled([
+    if (!search || search.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Search query is required and cannot be empty",
+      });
+    }
+
+    console.log(`🚀 Starting optimized scrape for: "${search}"`);
+
+    // Parallel execution with timeout
+    const scrapePromise = Promise.allSettled([
       scrapeAmazon(search, category, highprice),
       scrapeMyntra(search, highprice),
     ]);
 
-    let products = [];
-    if (amazon.status === "fulfilled") {
-      products = [...products, ...amazon.value];
-      console.log(`Amazon OK: ${amazon.value.length}`);
-    } else console.error("Amazon failed:", amazon.reason?.message);
-
-    if (myntra.status === "fulfilled") {
-      products = [...products, ...myntra.value];
-      console.log(`Myntra OK: ${myntra.value.length}`);
-    } else console.error("Myntra failed:", myntra.reason?.message);
-
-    products.sort(
-      (a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0)
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Scraping timeout exceeded")), 20000)
     );
+
+    const [amazonProducts, myntraProducts] = await Promise.race([
+      scrapePromise,
+      timeoutPromise,
+    ]);
+
+    let merged = [];
+    const sources = { amazon: false, myntra: false };
+
+    if (
+      amazonProducts.status === "fulfilled" &&
+      amazonProducts.value.length > 0
+    ) {
+      merged.push(...amazonProducts.value);
+      sources.amazon = true;
+      console.log(`✅ Amazon: ${amazonProducts.value.length} products`);
+    } else {
+      console.error("❌ Amazon scraping failed:", amazonProducts.reason);
+    }
+
+    if (
+      myntraProducts.status === "fulfilled" &&
+      myntraProducts.value.length > 0
+    ) {
+      merged.push(...myntraProducts.value);
+      sources.myntra = true;
+      console.log(`✅ Myntra: ${myntraProducts.value.length} products`);
+    } else {
+      console.error("❌ Myntra scraping failed:", myntraProducts.reason);
+    }
+
+    // Smart sorting: relevance score first, then price
+    merged.sort((a, b) => (b.score || 0) - (a.score || 0) || a.price - b.price);
+
+    const responseTime = Date.now() - startTime;
 
     res.json({
       success: true,
-      total: products.length,
-      products,
-      sources: {
-        amazon: amazon.status === "fulfilled",
-        myntra: myntra.status === "fulfilled",
+      products: merged.slice(0, 100), // Limit final results
+      metadata: {
+        total: merged.length,
+        returned: Math.min(merged.length, 100),
+        responseTime: `${responseTime}ms`,
+        sources,
+        cached: false, // Frontend can track cache hits differently
       },
     });
-  } catch (err) {
-    console.error("❌ Controller error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
+
+    console.log(
+      `🎉 Scraping completed in ${responseTime}ms: ${merged.length} total products`
+    );
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    console.error("💥 Scrape controller error:", error.message);
+
+    res.status(500).json({
+      success: false,
+      error: error.message.includes("timeout")
+        ? "Request timeout - try a simpler search"
+        : "Error scraping products",
+      products: [],
+      metadata: {
+        responseTime: `${responseTime}ms`,
+        sources: { amazon: false, myntra: false },
+      },
+    });
   }
+};
+
+// Cache statistics endpoint (optional)
+exports.cacheStats = (req, res) => {
+  const stats = searchCache.getStats();
+  res.json({
+    success: true,
+    cache: {
+      hits: stats.hits,
+      misses: stats.misses,
+      keys: stats.keys,
+      size: searchCache.keys().length,
+    },
+  });
 };
