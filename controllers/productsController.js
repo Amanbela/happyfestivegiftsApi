@@ -483,10 +483,10 @@ exports.scrape = async (req, res) => {
       products: merged.slice(0, 100), // Limit final results
       metadata: {
         total: merged.length,
-        returned: Math.min(merged.length, 100),
-        responseTime: `${responseTime}ms`,
-        sources,
-        cached: false, // Frontend can track cache hits differently
+        sources: {
+          amazon: amazonProducts.status === "fulfilled",
+          myntra: myntraProducts.status === "fulfilled",
+        },
       },
     });
 
@@ -494,19 +494,11 @@ exports.scrape = async (req, res) => {
       `🎉 Scraping completed in ${responseTime}ms: ${merged.length} total products`
     );
   } catch (error) {
-    const responseTime = Date.now() - startTime;
-    console.error("💥 Scrape controller error:", error.message);
-
+    console.error("Scrape controller error:", error);
     res.status(500).json({
       success: false,
-      error: error.message.includes("timeout")
-        ? "Request timeout - try a simpler search"
-        : "Error scraping products",
-      products: [],
-      metadata: {
-        responseTime: `${responseTime}ms`,
-        sources: { amazon: false, myntra: false },
-      },
+      error: error.message || "Error scraping products",
+      data: [],
     });
   }
 };
